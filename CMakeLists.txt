@@ -1,0 +1,8 @@
+﻿cmake_minimum_required (VERSION 3.8)
+project ("asio-test")
+set(ASIO asio-1.20.0 )
+add_executable (asio-test "main.cpp")
+set_target_properties(asio-test PROPERTIES CXX_STANDARD 11)
+add_library(asio INTERFACE)
+target_link_libraries(asio-test PRIVATE asio)
+target_include_directories(asio-test PRIVATE ${PROJECT_SOURCE_DIR}/${ASIO}/include)

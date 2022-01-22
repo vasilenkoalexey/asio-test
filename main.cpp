@@ -1,105 +1,136 @@
 
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <utility>
 
 #include "asio.hpp"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_opengl2.h"
+#include "cbor11.h"
+#include "client.h"
+#include "imgui.h"
+#include "map.h"
+#include "server.h"
+#include "unit.h"
 
-using asio::ip::tcp;
+static void glfw_error_callback(int error, const char *description) {
+    fprintf(stderr, "Glfw Error %d: %s\n", error, description);
+}
 
-class session : public std::enable_shared_from_this<session> {
-   public:
-    enum { max_body_length = 512 };
-    enum { magic = 0x1234 };
+int main(int argc, char *argv[]) {
+    glfwSetErrorCallback(glfw_error_callback);
 
-    session(tcp::socket socket) : socket_(std::move(socket)) {}
-
-    void start() { do_read_header(); }
-
-   private:
-    void do_read_header() {
-        auto self(shared_from_this());
-        socket_.async_read_some(
-            asio::buffer(&message_.header, sizeof(message_.header)),
-            [this, self](std::error_code ec, std::size_t /* length */) {
-                if (!ec && message_.header.magic == magic &&
-                    message_.header.body_length <= max_body_length) {
-                    do_read_body();
-                }
-            });
+    if (!glfwInit()) {
+        return 1;
     }
 
-    void do_read_body() {
-        auto self(shared_from_this());
-        socket_.async_read_some(
-            asio::buffer(message_.body, message_.header.body_length),
-            [this, self](std::error_code ec, std::size_t /* length */) {
-                if (!ec) {
-                    do_write();
-                }
-            });
+    GLFWwindow *window = glfwCreateWindow(1280, 720, "asio-test", NULL, NULL);
+    if (window == NULL) {
+        return 1;
     }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);  // Enable vsync
 
-    void do_write() {
-        auto self(shared_from_this());
-        asio::async_write(
-            socket_,
-            asio::buffer(&message_,
-                         sizeof(message_.header) + message_.header.body_length),
-            [this, self](std::error_code ec, std::size_t /*length*/) {
-                if (!ec) {
-                    do_read_header();
-                }
-            });
-    }
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    (void)io;
 
-    tcp::socket socket_;
-    struct {
-        struct {
-            uint32_t magic;
-            uint32_t body_length;
-        } header;
-        char body[max_body_length];
-    } message_;
-};
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL2_Init();
 
-class server {
-   public:
-    server(asio::io_context& io_context, short port)
-        : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
-        do_accept();
-    }
+    asio::io_context io_context0;
+    asio::ip::tcp::endpoint endpoint(
+        asio::ip::address::from_string("127.0.0.1"), 3000);
+    network::Server server(io_context0, endpoint);
 
-   private:
-    void do_accept() {
-        acceptor_.async_accept([this](std::error_code ec, tcp::socket socket) {
-            if (!ec) {
-                std::make_shared<session>(std::move(socket))->start();
-            }
+    const auto t = std::make_shared<unit_type>();
+    map world(100, 100);
+    unit unit1(world.get(3, 5), .300f, t);
+    unit unit2(world.get(30, 5), .300f, t);
 
-            do_accept();
-        });
-    }
+    unit1.move_to(world.get(1, 1));
+    unit2.move_to(world.get(3, 3));
 
-    tcp::acceptor acceptor_;
-};
+    cbor::array delta = cbor::array{};
 
-int main(int argc, char* argv[]) {
-    try {
-        if (argc != 2) {
-            std::cerr << "Usage: async_tcp_echo_server <port>\n";
-            return 1;
+    asio::io_context io_context1;
+    asio::ip::tcp::resolver resolver(io_context1);
+    auto endpoints = resolver.resolve(endpoint);
+    network::Client client(io_context1, endpoints,
+                           [&](const uint32_t opcode, const std::string &body) {
+                               std::cerr << "Message: " << body << "\n";
+                           });
+
+    client.write_msg(0, "test");
+
+    while (!glfwWindowShouldClose(window)) {
+
+        // update game state
+        unit1.update(delta);
+        unit2.update(delta);
+
+        // send state changes to clients
+        if (!delta.empty()) {
+            server.broadcast(0, delta);
+            delta.clear();
         }
 
-        asio::io_context io_context;
+        // poll asyn io events on server
+        server.poll();
 
-        server s(io_context, std::atoi(argv[1]));
+        // poll asyn io events on client
+        client.poll();
 
-        io_context.run();
-    } catch (std::exception& e) {
-        std::cerr << "Exception: " << e.what() << "\n";
+        // poll keyboard/mouse events
+        glfwPollEvents();
+
+        // render
+        ImGui_ImplOpenGL2_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        if (ImGui::Begin("Dear ImGui Metrics/Debugger")) {
+            // Basic info
+            ImGui::Text("Dear ImGui %s", ImGui::GetVersion());
+            ImGui::Text("Application average %.3f ms/frame (%.1f FPS)",
+                        1000.0f / io.Framerate, io.Framerate);
+            ImGui::Text("%d vertices, %d indices (%d triangles)",
+                        io.MetricsRenderVertices, io.MetricsRenderIndices,
+                        io.MetricsRenderIndices / 3);
+            ImGui::Text("%d visible windows, %d active allocations",
+                        io.MetricsRenderWindows, io.MetricsActiveAllocations);
+
+            ImGui::End();
+        }
+
+        ImGui::Render();
+        int display_w, display_h;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+
+        const static ImVec4 clear_color = ImVec4(.45f, .55f, .6f, 1.f);
+        glClearColor(clear_color.x * clear_color.w,
+                     clear_color.y * clear_color.w,
+                     clear_color.z * clear_color.w, clear_color.w);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+
+        glfwMakeContextCurrent(window);
+        glfwSwapBuffers(window);
     }
+
+    ImGui_ImplOpenGL2_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
 
     return 0;
 }
